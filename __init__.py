@@ -509,30 +509,78 @@ class MemPalaceProvider(MemoryProvider):
         handler = getattr(self, f"_tool_{tool_name}", None)
         if handler is None:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
-        try:
-            result = handler(**(args or {}))
+        # One retry on stale-chroma errors: chromadb caches a PersistentClient
+        # module-globally; if it got poisoned (HNSW compaction contention, WAL
+        # race), every call in this process sees the same error until the
+        # cache is dropped.
+        for attempt in (0, 1):
+            try:
+                result = handler(**(args or {}))
+            except TypeError as e:
+                logger.warning("Tool '%s' arg mismatch: %s", tool_name, e)
+                return json.dumps({"error": f"Invalid arguments: {e}"})
+            except Exception as e:
+                if attempt == 0 and self._is_stale_chroma_error(e):
+                    logger.info("Tool '%s' hit stale chroma cache, retrying", tool_name)
+                    self._invalidate_col_cache()
+                    continue
+                logger.exception("MemPalace tool '%s' failed", tool_name)
+                return json.dumps({"error": str(e)})
+            # Handler returned a dict — inspect for stale-chroma errors that
+            # were caught internally and wrapped into {"error": ...}.
+            if isinstance(result, dict):
+                err = result.get("error")
+                if attempt == 0 and err and self._is_stale_chroma_error(err):
+                    logger.info("Tool '%s' returned stale-chroma error, retrying", tool_name)
+                    self._invalidate_col_cache()
+                    continue
             if isinstance(result, str):
                 return result
             return json.dumps(result)
-        except TypeError as e:
-            logger.warning("Tool '%s' arg mismatch: %s", tool_name, e)
-            return json.dumps({"error": f"Invalid arguments: {e}"})
-        except Exception as e:
-            logger.exception("MemPalace tool '%s' failed", tool_name)
-            return json.dumps({"error": str(e)})
+        # fell through both attempts — shouldn't happen, return empty error
+        return json.dumps({"error": "retry exhausted"})
 
     # -- Internal: collection / KG / metadata caches -----------------------
 
-    def _get_col(self, create: bool = False):
+    # Signatures that indicate chromadb's internal state is poisoned and a
+    # cached client needs to be dropped before retrying. chromadb keeps its
+    # PersistentClient alive at module level, so a write that fails during
+    # HNSW compaction leaves every subsequent op in the same process seeing
+    # the same error — even if the on-disk DB is fine.
+    _CHROMA_STALE_HINTS = (
+        "file is not a database",
+        "failed to get segments",
+        "error finding id",
+        "error executing plan",
+    )
+
+    def _is_stale_chroma_error(self, exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(h in msg for h in self._CHROMA_STALE_HINTS)
+
+    def _invalidate_col_cache(self) -> None:
+        """Drop our cached collection + ChromaBackend's cached PersistentClient
+        so the next call re-opens a fresh one."""
+        with self._col_lock:
+            self._col = None
+        try:
+            from mempalace.palace import _DEFAULT_BACKEND
+            _DEFAULT_BACKEND._clients.clear()
+        except Exception:
+            pass
+
+    def _get_col(self, create: bool = False, _retry: bool = True):
         with self._col_lock:
             if self._col is not None:
                 return self._col
-        from mempalace.backends.chroma import ChromaBackend
-        backend = ChromaBackend()
         try:
-            col = backend.get_collection(self._palace_path, "mempalace_drawers", create=create)
+            from mempalace.palace import get_collection
+            col = get_collection(self._palace_path, create=create)
         except Exception as e:
             logger.warning("get_collection failed: %s", e)
+            if _retry and self._is_stale_chroma_error(e):
+                self._invalidate_col_cache()
+                return self._get_col(create=create, _retry=False)
             return None
         with self._col_lock:
             self._col = col
@@ -600,32 +648,39 @@ class MemPalaceProvider(MemoryProvider):
     # -- Background write helpers (used by sync_turn, on_session_end, etc) -
 
     def _store_drawer_bg(self, wing: str, room: str, content: str) -> None:
-        try:
-            col = self._get_col(create=True)
-            if col is None:
+        for attempt in (0, 1):
+            try:
+                col = self._get_col(create=True)
+                if col is None:
+                    return
+                drawer_id = (
+                    f"drawer_{wing}_{room}_"
+                    + hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]
+                )
+                existing = col.get(ids=[drawer_id])
+                if existing and existing["ids"]:
+                    return  # idempotent
+                col.upsert(
+                    ids=[drawer_id],
+                    documents=[content],
+                    metadatas=[{
+                        "wing": wing,
+                        "room": room,
+                        "source_file": "",
+                        "chunk_index": 0,
+                        "added_by": "hermes",
+                        "filed_at": datetime.now().isoformat(),
+                    }],
+                )
+                self._invalidate_meta_cache()
                 return
-            drawer_id = (
-                f"drawer_{wing}_{room}_"
-                + hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]
-            )
-            existing = col.get(ids=[drawer_id])
-            if existing and existing["ids"]:
-                return  # idempotent
-            col.upsert(
-                ids=[drawer_id],
-                documents=[content],
-                metadatas=[{
-                    "wing": wing,
-                    "room": room,
-                    "source_file": "",
-                    "chunk_index": 0,
-                    "added_by": "hermes",
-                    "filed_at": datetime.now().isoformat(),
-                }],
-            )
-            self._invalidate_meta_cache()
-        except Exception as e:
-            logger.warning("MemPalace _store_drawer_bg failed: %s", e)
+            except Exception as e:
+                if attempt == 0 and self._is_stale_chroma_error(e):
+                    logger.info("MemPalace _store_drawer_bg: stale chroma cache, retrying")
+                    self._invalidate_col_cache()
+                    continue
+                logger.warning("MemPalace _store_drawer_bg failed: %s", e)
+                return
 
     def _write_diary_bg(self, agent_name: str, entry: str, topic: str = "general") -> None:
         try:
