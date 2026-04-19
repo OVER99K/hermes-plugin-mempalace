@@ -92,7 +92,7 @@ class MemPalaceProvider(MemoryProvider):
         try:
             import mempalace  # noqa: F401
             palace_path = _resolve_palace_path()
-            chroma_db = os.path.join(os.path.dirname(palace_path), "chroma.sqlite3")
+            chroma_db = os.path.join(palace_path, "chroma.sqlite3")
             return os.path.exists(chroma_db)
         except ImportError:
             return False
