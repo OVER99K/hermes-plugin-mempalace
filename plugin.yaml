@@ -1,0 +1,6 @@
+name: mempalace
+description: MemPalace — local semantic memory with knowledge graph, diary, and structured retrieval (by Milla Jovovich & Ben Sigman)
+version: "1.0"
+author: over
+requires:
+  - mempalace>=3.0
