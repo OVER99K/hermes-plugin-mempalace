@@ -198,7 +198,7 @@ class MemPalaceProvider(MemoryProvider):
         entry = f"User: {user_content[:400]}\nAssistant: {assistant_content[:800]}"
         threading.Thread(
             target=self._store_drawer_bg,
-            args=(self._wing, "conversations", entry),
+            args=(self._wing, self._session_id, entry),
             daemon=True,
         ).start()
 
@@ -224,10 +224,9 @@ class MemPalaceProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         if action in ("add", "replace") and content:
-            room = "memory" if target == "memory" else "user-profile"
             threading.Thread(
                 target=self._store_drawer_bg,
-                args=(self._wing, room, content),
+                args=(self._wing, self._session_id, content),
                 daemon=True,
             ).start()
 
@@ -245,7 +244,7 @@ class MemPalaceProvider(MemoryProvider):
             combined = "\n".join(texts[-5:])
             threading.Thread(
                 target=self._store_drawer_bg,
-                args=(self._wing, "compressed-context", combined),
+                args=(self._wing, self._session_id, combined),
                 daemon=True,
             ).start()
         return ""
