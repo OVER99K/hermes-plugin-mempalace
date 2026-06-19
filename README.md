@@ -2,7 +2,7 @@
 
 MemPalace memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-Bridges Hermes's `MemoryProvider` interface to [MemPalace](https://github.com/MemPalace/mempalace) — a local-first semantic memory system with ChromaDB vector search, a SQLite knowledge graph, agent diaries, and wing/room/drawer organisation. Once installed, the agent gains five memory tools, automatic session-end diary writes, and pre-compression distillation that preserves key turns before Hermes discards them.
+Bridges Hermes's `MemoryProvider` interface to [MemPalace](https://github.com/MemPalace/mempalace) — a local-first semantic memory system with ChromaDB vector search, a SQLite knowledge graph, agent diaries, and wing/room/drawer organisation. Once installed, the agent gains the full MemPalace tool surface, automatic session-end diary writes, and pre-compression distillation that preserves key turns before Hermes discards them.
 
 ## Install
 
@@ -21,8 +21,10 @@ memory:
 You also need MemPalace itself installed:
 
 ```
-pip install 'mempalace>=3.0'
+pip install 'mempalace>=3.4.1' 'chromadb==1.5.9' 'aiohttp>=3.14,<3.15'
 ```
+
+If Hermes is maintained from a source checkout with `uv sync`, read [Surviving Hermes updates](docs/hermes-update-survival.md). Exact syncs can prune plugin-only dependencies from the active Hermes venv; the included guard script can verify and repair the runtime environment.
 
 ## Configuration
 
