@@ -4,6 +4,15 @@ MemPalace memory provider for [Hermes Agent](https://github.com/NousResearch/her
 
 Bridges Hermes's `MemoryProvider` interface to [MemPalace](https://github.com/MemPalace/mempalace) — a local-first semantic memory system with ChromaDB vector search, a SQLite knowledge graph, agent diaries, and wing/room/drawer organisation. Once installed, the agent gains five memory tools, automatic session-end diary writes, and pre-compression distillation that preserves key turns before Hermes discards them.
 
+## Companion X/Twitter Memory
+
+For social monitoring profiles, pair MemPalace with
+[Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet). Hermes Tweet can
+collect X/Twitter account, post, or trend context inside Hermes, while
+MemPalace can preserve reusable campaign facts, audience constraints, and
+follow-up notes across sessions. Hermes Tweet is a third-party project
+maintained by Xquik-dev, not by this repository.
+
 ## Install
 
 ```
