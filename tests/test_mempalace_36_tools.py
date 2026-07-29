@@ -119,6 +119,21 @@ def test_delete_by_source_aborts_before_drawers_when_closet_cleanup_fails(provid
     assert provider._col.count() == 1
 
 
+def test_delete_by_source_aborts_when_closet_index_cannot_be_inspected(provider, monkeypatch):
+    provider._col = FakeCollection([
+        ("one", "a", {"wing": "agent", "room": "research", "source_file": "bad.jsonl"}),
+    ])
+
+    def fail_lookup(*args, **kwargs):
+        raise RuntimeError("closet index unavailable")
+
+    monkeypatch.setattr("mempalace.palace.get_closets_collection", fail_lookup)
+    result = provider._tool_mempalace_delete_by_source("bad.jsonl", dry_run=False)
+    assert result["success"] is False
+    assert provider._col.deleted_where is None
+    assert provider._col.count() == 1
+
+
 def test_checkpoint_batches_added_duplicates_errors_and_diary(provider, monkeypatch):
     monkeypatch.setattr(provider, "_tool_mempalace_check_duplicate", lambda content, threshold=0.9: {"is_duplicate": content == "duplicate", "matches": [{"id": "existing"}]})
     monkeypatch.setattr(provider, "_tool_mempalace_add_drawer", lambda wing, room, content, source_file=None: {"success": True, "drawer_id": content, "source_file": source_file})
@@ -140,6 +155,28 @@ def test_checkpoint_batches_added_duplicates_errors_and_diary(provider, monkeypa
 def test_duplicate_thresholds_are_bounded(provider):
     assert "between 0.0 and 1.0" in provider._tool_mempalace_check_duplicate("x", threshold=1.1)["error"]
     assert "between 0.0 and 1.0" in provider._tool_mempalace_checkpoint([], dedup_threshold=-0.1)["error"]
+
+
+def test_checkpoint_fails_closed_when_duplicate_check_errors(provider, monkeypatch):
+    writes = []
+    monkeypatch.setattr(
+        provider,
+        "_tool_mempalace_check_duplicate",
+        lambda content, threshold=0.9: {"error": "vector index unavailable"},
+    )
+    monkeypatch.setattr(
+        provider,
+        "_tool_mempalace_add_drawer",
+        lambda *args, **kwargs: writes.append((args, kwargs)) or {"success": True},
+    )
+    result = provider._tool_mempalace_checkpoint([
+        {"wing": "agent", "room": "facts", "content": "must not be written"},
+    ])
+    assert writes == []
+    assert result["added"] == []
+    assert result["errors"][0]["item_index"] == 0
+    assert result["errors"][0]["retryable"] is True
+    assert "item was not written" in result["errors"][0]["error"]
 
 
 def test_kg_supersede_is_atomic_and_preserves_provenance(provider, tmp_path):

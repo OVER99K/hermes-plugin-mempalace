@@ -56,6 +56,16 @@ The plugin calls the MemPalace Python library directly in the Hermes process. It
 
 The full native surface also includes drawer CRUD, duplicate checks, taxonomy, KG add/invalidate/timeline/stats, graph traversal/stats, diary reads, hook settings, and source-scoped search. MemPalace 3.6 provenance fields (`valid_to`, source drawer/file, adapter, confidence) are accepted by `mempalace_kg_add` and `mempalace_kg_supersede`.
 
+## Tests
+
+The focused provider tests are self-contained and do not require a Hermes Agent checkout. They install MemPalace and its runtime dependencies from `requirements-test.txt`; `tests/conftest.py` supplies only the minimal `MemoryProvider` interface needed to import the plugin.
+
+```bash
+python -m venv .test-venv
+.test-venv/bin/pip install -r requirements-test.txt
+.test-venv/bin/pytest -q
+```
+
 ## Automatic behaviour
 
 - **Prefetch**: on every user turn, kicks off a background semantic search. The result is injected into context on the *next* turn if it's ready, or fetched synchronously as a fallback.

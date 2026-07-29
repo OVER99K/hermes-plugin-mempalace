@@ -1208,7 +1208,7 @@ class MemPalaceProvider(MemoryProvider):
         if not isinstance(items, list):
             return {"error": "items must be a list of {wing, room, content} objects"}
         out: Dict[str, Any] = {"added": [], "duplicates": [], "errors": []}
-        for item in items:
+        for item_index, item in enumerate(items):
             if not isinstance(item, dict) or not all(
                 isinstance(item.get(key), str) and item.get(key)
                 for key in ("wing", "room", "content")
@@ -1218,6 +1218,14 @@ class MemPalaceProvider(MemoryProvider):
                 })
                 continue
             duplicate = self._tool_mempalace_check_duplicate(item["content"], threshold=threshold)
+            if duplicate.get("error"):
+                out["errors"].append({
+                    "item_index": item_index,
+                    "room": item["room"],
+                    "error": f"duplicate check failed; item was not written: {duplicate['error']}",
+                    "retryable": True,
+                })
+                continue
             if duplicate.get("is_duplicate"):
                 out["duplicates"].append({
                     "room": item["room"], "matches": duplicate.get("matches", []),
