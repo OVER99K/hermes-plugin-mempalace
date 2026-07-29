@@ -21,7 +21,7 @@ memory:
 You also need MemPalace itself installed:
 
 ```
-pip install 'mempalace>=3.4.1' 'chromadb==1.5.9' 'aiohttp>=3.14,<3.15'
+pip install 'mempalace>=3.6.0' 'chromadb==1.5.9' 'aiohttp>=3.14,<3.15'
 ```
 
 If Hermes is maintained from a source checkout with `uv sync`, read [Surviving Hermes updates](docs/hermes-update-survival.md). Exact syncs can prune plugin-only dependencies from the active Hermes venv; the included guard script can verify and repair the runtime environment.
@@ -38,15 +38,23 @@ All settings are optional — sensible defaults are used.
 
 If `~/.mempalace/config.json` exists and contains a `palace_path` field, that takes precedence over the default (but `MEMPALACE_PALACE_PATH` still wins overall).
 
-## Tools exposed to the agent
+## Native tools exposed to the agent
+
+The plugin calls the MemPalace Python library directly in the Hermes process. It does not start or connect to an MCP server.
 
 | Tool | What it does |
 |---|---|
-| `mempalace_search` | Semantically search stored memories; optionally scope to a wing |
-| `mempalace_add` | File a memory into a `wing/room` drawer |
-| `mempalace_diary` | Write a dated diary entry for the current agent identity |
+| `mempalace_search` | Semantically search stored memories; optionally scope by wing, room, or exact source |
+| `mempalace_add_drawer` | File a memory into a `wing/room` drawer |
+| `mempalace_checkpoint` | Deduplicate and save several memories plus an optional diary entry in one call |
+| `mempalace_list_drawers` | Browse drawers with `authored_at`/`filed_at` chronology and ISO time windows |
+| `mempalace_delete_by_source` | Dry-run-first cleanup of drawers and closets from one exact source |
+| `mempalace_diary_write` | Write a dated diary entry for an agent |
 | `mempalace_status` | Palace stats — drawer count and wing/room breakdown |
 | `mempalace_kg_query` | Query the knowledge graph for relationships about an entity |
+| `mempalace_kg_supersede` | Atomically replace a temporal fact at one shared boundary |
+
+The full native surface also includes drawer CRUD, duplicate checks, taxonomy, KG add/invalidate/timeline/stats, graph traversal/stats, diary reads, hook settings, and source-scoped search. MemPalace 3.6 provenance fields (`valid_to`, source drawer/file, adapter, confidence) are accepted by `mempalace_kg_add` and `mempalace_kg_supersede`.
 
 ## Automatic behaviour
 
@@ -67,7 +75,7 @@ Hermes ships with several memory providers (`mem0`, `honcho`, `byterover`, `hind
 
 ## Compatibility
 
-Built against Hermes Agent's `agent.memory_provider.MemoryProvider` interface. Tested with MemPalace 3.x.
+Built against Hermes Agent's `agent.memory_provider.MemoryProvider` interface. The 1.2 tool surface requires MemPalace 3.6+.
 
 ## Credits
 

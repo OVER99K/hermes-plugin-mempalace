@@ -3,7 +3,7 @@
 Local-first semantic memory with ChromaDB vector search, knowledge graph,
 agent diary, and structured wing/room/drawer retrieval.
 
-All operations run in-process — no MCP subprocess required. The 23 tools
+All operations run in-process — no MCP subprocess required. The native tools
 exposed here cover drawer CRUD, navigation, knowledge-graph reads/writes,
 diary, and palace-level status. Handlers delegate to the mempalace library
 (`searcher`, `backends.chroma`, `knowledge_graph`, `palace_graph`).
@@ -26,7 +26,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +38,7 @@ _PALACE_PATH_ENV = "MEMPALACE_PALACE_PATH"
 _DEFAULT_HERMES_HOME_PALACE = os.path.expanduser("~/.mempalace/palace")
 _METADATA_CACHE_TTL = 5.0
 _MAX_RESULTS = 100
+_PAGE_SIZE = 1000
 
 
 PALACE_PROTOCOL = """MemPalace Memory Protocol — how to actually remember:
@@ -45,7 +46,7 @@ PALACE_PROTOCOL = """MemPalace Memory Protocol — how to actually remember:
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search first. Never guess — verify.
 3. IF UNSURE about a fact (name, date, relationship, preference): say "let me check" and query the palace. Wrong is worse than slow.
 4. WHEN YOU LEARN SOMETHING WORTH KEEPING: call mempalace_add_drawer (content) or mempalace_kg_add (structured fact).
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+5. WHEN A SINGLE-VALUED FACT CHANGES: call mempalace_kg_supersede so the old and new facts share one atomic temporal boundary. Use invalidate/add separately only when they are genuinely separate events.
 6. AT SESSION END: call mempalace_diary_write with what happened, what was learned, what matters.
 
 Storage is not memory — but storage + this protocol = memory."""
@@ -113,6 +114,33 @@ def _fmt_results(results: dict, max_chars: int = 2000) -> str:
         if total >= max_chars:
             break
     return "\n---\n".join(parts)
+
+
+def _parse_time_bound(value: Optional[str], field: str) -> Optional[datetime]:
+    """Parse an ISO date or timestamp into a naive UTC-comparable datetime."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an ISO date or timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be YYYY-MM-DD or an ISO timestamp") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _metadata_time(meta: dict) -> Optional[datetime]:
+    """Prefer source chronology, falling back to ingestion chronology."""
+    for key in ("authored_at", "filed_at"):
+        try:
+            parsed = _parse_time_bound(meta.get(key), key)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return parsed
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +333,9 @@ class MemPalaceProvider(MemoryProvider):
                         "limit": {"type": "integer", "description": "Max results (default 5, max 100)"},
                         "wing": {"type": "string", "description": "Limit to a wing (optional)"},
                         "room": {"type": "string", "description": "Limit to a room (optional)"},
+                        "source_file": {"type": "string", "description": "Exact source-file filter (optional)"},
                         "max_distance": {"type": "number", "description": "Max cosine distance; lower=stricter (default 1.5)"},
+                        "min_similarity": {"type": "number", "description": "Minimum returned similarity in [0,1] (optional)"},
                     },
                     "required": ["query"],
                 },
@@ -317,7 +347,7 @@ class MemPalaceProvider(MemoryProvider):
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "Content to check for duplicates"},
-                        "threshold": {"type": "number", "description": "Similarity threshold (default 0.9)"},
+                        "threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Similarity threshold (default 0.9; 0.0-1.0)"},
                     },
                     "required": ["content"],
                 },
@@ -366,6 +396,8 @@ class MemPalaceProvider(MemoryProvider):
                     "properties": {
                         "wing": {"type": "string", "description": "Filter by wing (optional)"},
                         "room": {"type": "string", "description": "Filter by room (optional)"},
+                        "since": {"type": "string", "description": "Inclusive ISO bound; uses authored_at when present, otherwise filed_at"},
+                        "before": {"type": "string", "description": "Exclusive ISO bound; uses authored_at when present, otherwise filed_at"},
                         "limit": {"type": "integer", "description": "Max results (default 20, max 100)"},
                         "offset": {"type": "integer", "description": "Pagination offset (default 0)"},
                     },
@@ -384,6 +416,44 @@ class MemPalaceProvider(MemoryProvider):
                         "room": {"type": "string", "description": "New room (optional)"},
                     },
                     "required": ["drawer_id"],
+                },
+            },
+            {
+                "name": "mempalace_delete_by_source",
+                "description": "Preview or delete every drawer and searchable closet whose source_file matches exactly. Dry-run is the default; deletion is irreversible.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source_file": {"type": "string", "description": "Exact stored source_file value"},
+                        "dry_run": {"type": "boolean", "description": "Preview only (default true)"},
+                    },
+                    "required": ["source_file"],
+                },
+            },
+            {
+                "name": "mempalace_checkpoint",
+                "description": "Batch-save several deduplicated memories and an optional diary entry in one native Hermes tool call.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "Memories to deduplicate and file",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "wing": {"type": "string"},
+                                    "room": {"type": "string"},
+                                    "content": {"type": "string"},
+                                    "source_file": {"type": "string"},
+                                },
+                                "required": ["wing", "room", "content"],
+                            },
+                        },
+                        "diary": {"type": "object", "description": "Optional {agent_name, entry, topic} diary record"},
+                        "dedup_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Duplicate similarity threshold (default 0.9; 0.0-1.0)"},
+                    },
+                    "required": ["items"],
                 },
             },
             {
@@ -408,8 +478,13 @@ class MemPalaceProvider(MemoryProvider):
                         "subject": {"type": "string", "description": "Subject entity"},
                         "predicate": {"type": "string", "description": "Relationship (snake_case)"},
                         "object": {"type": "string", "description": "Object entity or value"},
-                        "valid_from": {"type": "string", "description": "Start date (YYYY-MM-DD, optional)"},
+                        "valid_from": {"type": "string", "description": "Start date/timestamp (optional)"},
+                        "valid_to": {"type": "string", "description": "End date/timestamp for an already-ended historical fact (optional)"},
+                        "confidence": {"type": "number", "description": "Confidence in [0,1] (default 1.0)"},
                         "source_closet": {"type": "string", "description": "Closet this fact came from (optional)"},
+                        "source_file": {"type": "string", "description": "Source file path (optional)"},
+                        "source_drawer_id": {"type": "string", "description": "Source drawer ID (optional)"},
+                        "adapter_name": {"type": "string", "description": "Ingestion adapter name (optional)"},
                     },
                     "required": ["subject", "predicate", "object"],
                 },
@@ -426,6 +501,26 @@ class MemPalaceProvider(MemoryProvider):
                         "ended": {"type": "string", "description": "End date (YYYY-MM-DD, default today)"},
                     },
                     "required": ["subject", "predicate", "object"],
+                },
+            },
+            {
+                "name": "mempalace_kg_supersede",
+                "description": "Atomically replace one single-valued fact with another at a shared temporal boundary. Prefer this over separate invalidate/add calls for model, employer, address, status, and similar changes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "predicate": {"type": "string"},
+                        "old_object": {"type": "string"},
+                        "new_object": {"type": "string"},
+                        "at": {"type": "string", "description": "Boundary as YYYY-MM-DD or canonical UTC timestamp; defaults to now"},
+                        "confidence": {"type": "number", "description": "Confidence for the successor fact (default 1.0)"},
+                        "source_closet": {"type": "string"},
+                        "source_file": {"type": "string"},
+                        "source_drawer_id": {"type": "string"},
+                        "adapter_name": {"type": "string"},
+                    },
+                    "required": ["subject", "predicate", "old_object", "new_object"],
                 },
             },
             {
@@ -619,6 +714,23 @@ class MemPalaceProvider(MemoryProvider):
             offset += len(batch["metadatas"])
         return out
 
+    def _fetch_all_metadata_rows(self, col, where=None) -> tuple[list, list]:
+        ids: list = []
+        metadatas: list = []
+        offset = 0
+        while True:
+            kwargs = {"include": ["metadatas"], "limit": _PAGE_SIZE, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            page = col.get(**kwargs)
+            page_ids = page.get("ids") or []
+            if not page_ids:
+                break
+            ids.extend(page_ids)
+            metadatas.extend(page.get("metadatas") or [{} for _ in page_ids])
+            offset += len(page_ids)
+        return ids, metadatas
+
     def _get_cached_metadata(self, col, where=None) -> list:
         now = time.time()
         with self._meta_lock:
@@ -705,7 +817,7 @@ class MemPalaceProvider(MemoryProvider):
             logger.warning("MemPalace prefetch search failed: %s", e)
             return ""
 
-    # -- Tool handlers (23) ------------------------------------------------
+    # -- Tool handlers (26) ------------------------------------------------
     # Naming: _tool_<tool_name>. Each returns a dict; the dispatcher wraps
     # it in json.dumps.
 
@@ -795,7 +907,9 @@ class MemPalaceProvider(MemoryProvider):
         limit: int = 5,
         wing: str = None,
         room: str = None,
+        source_file: Optional[str] = None,
         max_distance: float = 1.5,
+        min_similarity: Optional[float] = None,
     ) -> dict:
         from mempalace.searcher import search_memories
         from mempalace.query_sanitizer import sanitize_query
@@ -811,6 +925,7 @@ class MemPalaceProvider(MemoryProvider):
             palace_path=self._palace_path,
             wing=wing,
             room=room,
+            source_file=source_file,
             n_results=limit,
             max_distance=max_distance,
         )
@@ -824,9 +939,27 @@ class MemPalaceProvider(MemoryProvider):
                 "clean_length": sanitized["clean_length"],
                 "clean_query": sanitized["clean_query"],
             }
+        if min_similarity is not None:
+            try:
+                min_similarity = float(min_similarity)
+            except (TypeError, ValueError):
+                return {"error": "min_similarity must be a number in [0,1]"}
+            if not 0.0 <= min_similarity <= 1.0:
+                return {"error": "min_similarity must be a number in [0,1]"}
+            result["results"] = [
+                item for item in result.get("results", [])
+                if float(item.get("similarity", 1.0 - float(item.get("distance", 1.0)))) >= min_similarity
+            ]
+            result["total_after_similarity_filter"] = len(result["results"])
         return result
 
     def _tool_mempalace_check_duplicate(self, content: str, threshold: float = 0.9) -> dict:
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            return {"error": "threshold must be a number between 0.0 and 1.0"}
+        if not 0.0 <= threshold <= 1.0:
+            return {"error": "threshold must be between 0.0 and 1.0"}
         col = self._get_col()
         if not col:
             return self._no_palace()
@@ -932,13 +1065,18 @@ class MemPalaceProvider(MemoryProvider):
             return {"error": str(e)}
 
     def _tool_mempalace_list_drawers(
-        self, wing: str = None, room: str = None, limit: int = 20, offset: int = 0,
+        self, wing: str = None, room: str = None, since: Optional[str] = None,
+        before: Optional[str] = None, limit: int = 20, offset: int = 0,
     ) -> dict:
         limit = max(1, min(int(limit), _MAX_RESULTS))
         offset = max(0, int(offset))
         try:
             wing = self._sanitize_optional(wing, "wing")
             room = self._sanitize_optional(room, "room")
+            since_dt = _parse_time_bound(since, "since")
+            before_dt = _parse_time_bound(before, "before")
+            if since_dt is not None and before_dt is not None and since_dt >= before_dt:
+                raise ValueError("since must be earlier than before")
         except ValueError as e:
             return {"error": str(e)}
         col = self._get_col()
@@ -955,23 +1093,151 @@ class MemPalaceProvider(MemoryProvider):
                 where = conditions[0]
             elif len(conditions) > 1:
                 where = {"$and": conditions}
-            kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
-            if where:
-                kwargs["where"] = where
-            res = col.get(**kwargs)
-            drawers = []
-            for i, did in enumerate(res["ids"]):
-                meta = res["metadatas"][i]
-                doc = res["documents"][i]
-                drawers.append({
+            ids, metadatas = self._fetch_all_metadata_rows(col, where=where)
+            candidates = []
+            for did, meta in zip(ids, metadatas):
+                effective_time = _metadata_time(meta)
+                if since_dt is not None and (effective_time is None or effective_time < since_dt):
+                    continue
+                if before_dt is not None and (effective_time is None or effective_time >= before_dt):
+                    continue
+                candidates.append((did, meta, effective_time))
+            candidates.sort(key=lambda item: (item[2] or datetime.min, item[0]), reverse=True)
+            total = len(candidates)
+            selected = candidates[offset:offset + limit]
+            selected_ids = [item[0] for item in selected]
+            docs_by_id = {}
+            if selected_ids:
+                page_rows = col.get(ids=selected_ids, include=["documents"])
+                docs_by_id = dict(zip(page_rows.get("ids") or [], page_rows.get("documents") or []))
+            page = []
+            for did, meta, _effective_time in selected:
+                doc = docs_by_id.get(did, "")
+                page.append({
                     "drawer_id": did,
                     "wing": meta.get("wing", ""),
                     "room": meta.get("room", ""),
                     "content_preview": (doc[:200] + "...") if len(doc) > 200 else doc,
+                    "authored_at": meta.get("authored_at"),
+                    "filed_at": meta.get("filed_at"),
+                    "source_file": meta.get("source_file", ""),
                 })
-            return {"drawers": drawers, "count": len(drawers), "offset": offset, "limit": limit}
+            return {"drawers": page, "total": total, "count": len(page), "offset": offset, "limit": limit}
         except Exception as e:
             return {"error": str(e)}
+
+    def _tool_mempalace_delete_by_source(self, source_file: str, dry_run: bool = True) -> dict:
+        if not isinstance(source_file, str) or not source_file.strip():
+            return {"success": False, "error": "source_file must be a non-empty string"}
+        col = self._get_col()
+        if not col:
+            return self._no_palace()
+        where = {"source_file": source_file}
+        try:
+            metas = self._fetch_all_metadata(col, where=where)
+            sample, seen = [], set()
+            for meta in metas:
+                location = (meta.get("wing", ""), meta.get("room", ""))
+                if location not in seen:
+                    seen.add(location)
+                    sample.append({"wing": location[0], "room": location[1]})
+                if len(sample) == 5:
+                    break
+            from mempalace.palace import get_closets_collection
+            from mempalace.backends.base import PalaceNotFoundError
+            closets = None
+            closet_ids = []
+            closet_error = None
+            try:
+                closets = get_closets_collection(self._palace_path, create=False)
+                if closets is not None:
+                    closet_ids = closets.get(where=where, include=[]).get("ids") or []
+            except PalaceNotFoundError:
+                closets = None
+            except Exception as exc:
+                closet_error = f"closet index unavailable: {exc}"
+            if dry_run:
+                result = {
+                    "success": closet_error is None, "dry_run": True, "source_file": source_file,
+                    "match_count": len(metas), "closet_match_count": len(closet_ids), "sample": sample,
+                }
+                if closet_error:
+                    result["error"] = closet_error
+                return result
+            if closet_error:
+                return {"success": False, "dry_run": False, "source_file": source_file, "error": closet_error}
+            closets_deleted = 0
+            if closets is not None and closet_ids:
+                try:
+                    closets.delete(where=where)
+                    closets_deleted = len(closet_ids)
+                except Exception as exc:
+                    return {
+                        "success": False, "dry_run": False, "source_file": source_file,
+                        "error": f"closet cleanup failed; drawer deletion was not attempted: {exc}",
+                        "deleted": 0, "closets_deleted": 0,
+                    }
+            try:
+                if metas:
+                    col.delete(where=where)
+            except Exception as exc:
+                self._invalidate_meta_cache()
+                return {
+                    "success": False, "partial": bool(closets_deleted), "dry_run": False,
+                    "source_file": source_file,
+                    "error": f"closets deleted but drawer cleanup failed: {exc}",
+                    "deleted": 0, "closets_deleted": closets_deleted,
+                }
+            self._invalidate_meta_cache()
+            return {
+                "success": True, "dry_run": False, "source_file": source_file,
+                "deleted": len(metas), "closets_deleted": closets_deleted,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _tool_mempalace_checkpoint(
+        self, items: list, diary: Optional[dict] = None, dedup_threshold: float = 0.9,
+    ) -> dict:
+        try:
+            threshold = float(dedup_threshold)
+        except (TypeError, ValueError):
+            return {"error": "dedup_threshold must be a number between 0.0 and 1.0"}
+        if not 0.0 <= threshold <= 1.0:
+            return {"error": "dedup_threshold must be between 0.0 and 1.0"}
+        if not isinstance(items, list):
+            return {"error": "items must be a list of {wing, room, content} objects"}
+        out: Dict[str, Any] = {"added": [], "duplicates": [], "errors": []}
+        for item in items:
+            if not isinstance(item, dict) or not all(
+                isinstance(item.get(key), str) and item.get(key)
+                for key in ("wing", "room", "content")
+            ):
+                out["errors"].append({
+                    "item": item, "error": "wing, room, content must be non-empty strings",
+                })
+                continue
+            duplicate = self._tool_mempalace_check_duplicate(item["content"], threshold=threshold)
+            if duplicate.get("is_duplicate"):
+                out["duplicates"].append({
+                    "room": item["room"], "matches": duplicate.get("matches", []),
+                })
+                continue
+            result = self._tool_mempalace_add_drawer(
+                item["wing"], item["room"], item["content"], item.get("source_file")
+            )
+            (out["added"] if result.get("success") else out["errors"]).append(result)
+        if diary is not None:
+            if not isinstance(diary, dict) or not isinstance(diary.get("entry"), str) or not diary.get("entry"):
+                out["errors"].append({
+                    "diary": diary, "error": "diary entry must be a non-empty string",
+                })
+            else:
+                out["diary"] = self._tool_mempalace_diary_write(
+                    diary.get("agent_name", self._agent_identity),
+                    diary["entry"], diary.get("topic", "session-checkpoint"),
+                )
+        return out
 
     def _tool_mempalace_update_drawer(
         self, drawer_id: str, content: str = None, wing: str = None, room: str = None,
@@ -1034,19 +1300,28 @@ class MemPalaceProvider(MemoryProvider):
 
     def _tool_mempalace_kg_add(
         self, subject: str, predicate: str, object: str,
-        valid_from: str = None, source_closet: str = None,
+        valid_from: str = None, valid_to: str = None, confidence: float = 1.0,
+        source_closet: str = None, source_file: str = None,
+        source_drawer_id: str = None, adapter_name: str = None,
     ) -> dict:
-        from mempalace.config import sanitize_name, sanitize_kg_value
+        from mempalace.config import sanitize_name, sanitize_kg_value, sanitize_iso_temporal
         try:
             subject = sanitize_kg_value(subject, "subject")
             predicate = sanitize_name(predicate, "predicate")
             object = sanitize_kg_value(object, "object")
-        except ValueError as e:
+            valid_from = sanitize_iso_temporal(valid_from, "valid_from")
+            valid_to = sanitize_iso_temporal(valid_to, "valid_to")
+            confidence = float(confidence)
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError("confidence must be in [0,1]")
+        except (TypeError, ValueError) as e:
             return {"success": False, "error": str(e)}
         kg = self._get_kg()
         triple_id = kg.add_triple(
             subject, predicate, object,
-            valid_from=valid_from, source_closet=source_closet,
+            valid_from=valid_from, valid_to=valid_to, confidence=confidence,
+            source_closet=source_closet, source_file=source_file,
+            source_drawer_id=source_drawer_id, adapter_name=adapter_name,
         )
         return {
             "success": True, "triple_id": triple_id,
@@ -1069,6 +1344,35 @@ class MemPalaceProvider(MemoryProvider):
             "success": True,
             "fact": f"{subject} → {predicate} → {object}",
             "ended": ended or "today",
+        }
+
+    def _tool_mempalace_kg_supersede(
+        self, subject: str, predicate: str, old_object: str, new_object: str,
+        at: str = None, confidence: float = 1.0, source_closet: str = None,
+        source_file: str = None, source_drawer_id: str = None, adapter_name: str = None,
+    ) -> dict:
+        from mempalace.config import sanitize_name, sanitize_kg_value, sanitize_iso_temporal
+        try:
+            subject = sanitize_kg_value(subject, "subject")
+            predicate = sanitize_name(predicate, "predicate")
+            old_object = sanitize_kg_value(old_object, "old_object")
+            new_object = sanitize_kg_value(new_object, "new_object")
+            at = sanitize_iso_temporal(at, "at")
+            confidence = float(confidence)
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError("confidence must be in [0,1]")
+        except (TypeError, ValueError) as e:
+            return {"success": False, "error": str(e)}
+        kg = self._get_kg()
+        triple_id = kg.supersede(
+            subject, predicate, old_object, new_object, at=at, confidence=confidence,
+            source_closet=source_closet, source_file=source_file,
+            source_drawer_id=source_drawer_id, adapter_name=adapter_name,
+        )
+        return {
+            "success": True, "triple_id": triple_id,
+            "fact": f"{subject} → {predicate} → {new_object}",
+            "superseded": old_object, "at": at or "now",
         }
 
     def _tool_mempalace_kg_timeline(self, entity: str = None) -> dict:
