@@ -244,11 +244,56 @@ class MemPalaceProvider(MemoryProvider):
             if role in ("user", "assistant") and content:
                 summary_parts.append(f"{role.title()}: {content[:300]}")
         if summary_parts:
+            # Serialize diary persistence before both Obsidian mirrors.  The
+            # previous implementation launched diary write and vault sync in
+            # separate threads, allowing the sync to race and miss the current
+            # session's diary entry.
             threading.Thread(
-                target=self._write_diary_bg,
+                target=self._finalize_vault_sync_bg,
                 args=(self._agent_identity, "\n".join(summary_parts[-10:])),
                 daemon=True,
             ).start()
+
+    def _finalize_vault_sync_bg(self, agent_name: str, entry: str) -> None:
+        """Persist the session diary, then refresh both Obsidian mirrors."""
+        self._write_diary_bg(agent_name, entry)
+        self._sync_vault_bg()
+
+    def _sync_vault_bg(self) -> None:
+        """Background sync MemPalace and Hermes sessions to Obsidian."""
+        try:
+            import subprocess
+            vault_script = os.path.join(
+                os.path.dirname(__file__), "sync_vault.py"
+            )
+            # Resolve python interpreter: prefer venv python, fall back to sys.executable
+            venv_python = os.path.join(
+                os.path.dirname(__file__), "..", "..",
+                "hermes-agent", "venv", "bin", "python3"
+            )
+            if not os.path.exists(venv_python):
+                import sys as _sys  # use sys module directly
+                venv_python = _sys.executable
+            subprocess.run(
+                [venv_python, vault_script],
+                timeout=60,
+                capture_output=True,
+                check=False,
+            )
+            # Keep the Hermes state.db session mirror in the same serialized
+            # end-of-session path as the MemPalace mirror.
+            state_script = os.path.expanduser(
+                "~/.hermes/scripts/obsidian-sync-state-sessions.py"
+            )
+            if os.path.exists(state_script):
+                subprocess.run(
+                    [venv_python, state_script],
+                    timeout=60,
+                    capture_output=True,
+                    check=False,
+                )
+        except Exception as exc:
+            logger.debug("Obsidian vault sync failed: %s", exc)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         if action in ("add", "replace") and content:
