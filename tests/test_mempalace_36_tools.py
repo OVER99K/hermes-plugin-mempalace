@@ -55,14 +55,16 @@ def provider(tmp_path):
     return p
 
 
-def test_schema_exposes_36_features_without_mcp(provider):
+def test_schema_exposes_37_features_without_mcp(provider):
     schemas = {schema["name"]: schema for schema in provider.get_tool_schemas()}
-    assert len(schemas) == 26
+    assert len(schemas) == 27
+    assert "mempalace_audit" in schemas
     assert "mempalace_kg_supersede" in schemas
     assert "mempalace_checkpoint" in schemas
     assert "mempalace_delete_by_source" in schemas
     assert {"since", "before"} <= set(schemas["mempalace_list_drawers"]["parameters"]["properties"])
     assert {"source_file", "min_similarity"} <= set(schemas["mempalace_search"]["parameters"]["properties"])
+    assert {"limit", "offset"} <= set(schemas["mempalace_kg_timeline"]["parameters"]["properties"])
     assert {"valid_to", "confidence", "source_file", "source_drawer_id", "adapter_name"} <= set(
         schemas["mempalace_kg_add"]["parameters"]["properties"]
     )
@@ -214,3 +216,54 @@ def test_kg_supersede_forwards_provenance(provider):
     assert kg.kwargs["source_file"] == "decision.md"
     assert kg.kwargs["source_drawer_id"] == "drawer-1"
     assert kg.kwargs["adapter_name"] == "hermes"
+
+
+def test_audit_is_bounded_read_only_and_has_no_repair_or_llm_path(provider, monkeypatch):
+    observed = {}
+
+    def audit_palace(*, palace_path, explicit_palace):
+        observed.update(palace_path=palace_path, explicit_palace=explicit_palace)
+        return {"scores": {"overall": 90}, "findings": ["a", "b", "c"]}
+
+    monkeypatch.setattr("mempalace.palace_audit.audit_palace", audit_palace)
+    result = provider._tool_mempalace_audit(sample_limit=2)
+    assert observed["palace_path"] == provider._palace_path
+    assert observed["explicit_palace"] is True
+    assert result["read_only"] is True
+    assert result["repair_performed"] is False
+    assert result["llm_invoked"] is False
+    assert result["report"]["findings"] == ["a", "b"]
+
+
+def test_timeline_uses_upstream_pagination_and_reports_total(provider):
+    class TimelineKG:
+        def __init__(self):
+            self.args = None
+
+        def timeline(self, entity, *, limit, offset):
+            self.args = (entity, limit, offset)
+            return [{"subject": "runtime", "predicate": "uses", "object": "model", "valid_from": "2026-01-01"}]
+
+        def timeline_total(self, entity):
+            return 7
+
+    kg = TimelineKG()
+    provider._kg = kg
+    result = provider._tool_mempalace_kg_timeline("runtime", limit=5000, offset=-2)
+    assert kg.args == ("runtime", 1000, 0)
+    assert result["total"] == 7
+    assert result["count"] == 1
+    assert result["timeline"][0]["date_provenance"]["valid_from_source"] == "upstream"
+    assert result["timeline"][0]["last_modified"] is None
+
+
+def test_drawer_date_provenance_keeps_unknown_last_modified_null(provider):
+    provider._col = FakeCollection([
+        ("one", "document", {"wing": "agent", "room": "facts", "authored_at": "2026-02-01T00:00:00Z", "filed_at": "2026-03-01T00:00:00Z"}),
+    ])
+    result = provider._tool_mempalace_get_drawer("one")
+    assert result["date_provenance"] == {
+        "chronology": "2026-02-01T00:00:00Z", "chronology_source": "authored_at",
+        "authored_at": "2026-02-01T00:00:00Z", "filed_at": "2026-03-01T00:00:00Z", "last_modified": None,
+    }
+    assert result["last_modified"] is None

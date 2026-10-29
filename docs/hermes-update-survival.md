@@ -73,7 +73,7 @@ Useful overrides:
 | `PY` | `$HERMES_SRC/.venv/bin/python` | Runtime Python to check/repair |
 | `UV` | `uv` | `uv` executable |
 | `PALACE` / `MEMPALACE_PALACE_PATH` | `$HOME/.mempalace/palace` | Palace data directory |
-| `REQ_MEMPALACE` | `3.4.1` | MemPalace package version to enforce |
+| `REQ_MEMPALACE` | `3.11.0` | MemPalace package version to enforce |
 | `REQ_CHROMADB` | `1.5.9` | ChromaDB package version to enforce |
 | `REQ_AIOHTTP` | `3.14.1` | aiohttp package version to enforce |
 | `LOG_FILE` | unset | Optional append-only log path |
