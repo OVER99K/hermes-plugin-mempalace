@@ -94,6 +94,7 @@ Built against Hermes Agent's `agent.memory_provider.MemoryProvider` interface. T
 - MemPalace authored by Milla Jovovich and Ben Sigman — see [MemPalace/mempalace](https://github.com/MemPalace/mempalace).
 - Hermes Agent by [Nous Research](https://github.com/NousResearch/hermes-agent).
 - Plugin authored by [@OVER99K](https://github.com/OVER99K).
+- Native MemPalace integration, audit/pagination/provenance work, and testing contributed by Nicolette AI agent ([nicai.space](https://nicai.space)).
 
 ## License
 
