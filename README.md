@@ -21,7 +21,7 @@ memory:
 You also need MemPalace itself installed:
 
 ```
-pip install 'mempalace>=3.6.0' 'chromadb==1.5.9' 'aiohttp>=3.14,<3.15'
+pip install 'mempalace>=3.11.0,<3.12.0' 'chromadb==1.5.9' 'aiohttp>=3.14,<3.15'
 ```
 
 If Hermes is maintained from a source checkout with `uv sync`, read [Surviving Hermes updates](docs/hermes-update-survival.md). Exact syncs can prune plugin-only dependencies from the active Hermes venv; the included guard script can verify and repair the runtime environment.
@@ -51,10 +51,12 @@ The plugin calls the MemPalace Python library directly in the Hermes process. It
 | `mempalace_delete_by_source` | Dry-run-first cleanup of drawers and closets from one exact source |
 | `mempalace_diary_write` | Write a dated diary entry for an agent |
 | `mempalace_status` | Palace stats — drawer count and wing/room breakdown |
+| `mempalace_audit` | Bounded, read-only 3.11 organization audit; it never repairs, mines, or invokes an LLM |
+| `mempalace_kg_timeline` | Paginated KG chronology with `limit`/`offset`, total count, and date provenance |
 | `mempalace_kg_query` | Query the knowledge graph for relationships about an entity |
 | `mempalace_kg_supersede` | Atomically replace a temporal fact at one shared boundary |
 
-The full native surface also includes drawer CRUD, duplicate checks, taxonomy, KG add/invalidate/timeline/stats, graph traversal/stats, diary reads, hook settings, and source-scoped search. MemPalace 3.6 provenance fields (`valid_to`, source drawer/file, adapter, confidence) are accepted by `mempalace_kg_add` and `mempalace_kg_supersede`.
+The full native surface also includes drawer CRUD, duplicate checks, taxonomy, KG add/invalidate/stats, graph traversal/stats, diary reads, hook settings, and source-scoped search. Drawer and KG read responses retain upstream timestamps with explicit date provenance. `last_modified` is returned only when stored; older/upstream records return `null` rather than a synthesized value. MemPalace 3.11 provenance fields (`valid_to`, source drawer/file, adapter, confidence) are accepted by `mempalace_kg_add` and `mempalace_kg_supersede`.
 
 ## Tests
 
@@ -85,7 +87,7 @@ Hermes ships with several memory providers (`mem0`, `honcho`, `byterover`, `hind
 
 ## Compatibility
 
-Built against Hermes Agent's `agent.memory_provider.MemoryProvider` interface. The 1.2 tool surface requires MemPalace 3.6+.
+Built against Hermes Agent's `agent.memory_provider.MemoryProvider` interface. The 1.3 tool surface requires MemPalace 3.11.x.
 
 ## Credits
 

@@ -39,6 +39,8 @@ _DEFAULT_HERMES_HOME_PALACE = os.path.expanduser("~/.mempalace/palace")
 _METADATA_CACHE_TTL = 5.0
 _MAX_RESULTS = 100
 _PAGE_SIZE = 1000
+_MAX_AUDIT_SAMPLE = 100
+
 
 
 PALACE_PROTOCOL = """MemPalace Memory Protocol — how to actually remember:
@@ -141,6 +143,41 @@ def _metadata_time(meta: dict) -> Optional[datetime]:
         if parsed is not None:
             return parsed
     return None
+
+
+def _drawer_temporal_provenance(meta: dict) -> dict:
+    """Expose stored chronology without manufacturing a source timestamp."""
+    authored_at = meta.get("authored_at")
+    filed_at = meta.get("filed_at")
+    last_modified = meta.get("last_modified")
+    if authored_at:
+        chronology, chronology_source = authored_at, "authored_at"
+    elif filed_at:
+        chronology, chronology_source = filed_at, "filed_at"
+    else:
+        chronology, chronology_source = None, None
+    return {
+        "chronology": chronology,
+        "chronology_source": chronology_source,
+        "authored_at": authored_at,
+        "filed_at": filed_at,
+        # Older records did not store this value; null is intentional, not now().
+        "last_modified": last_modified,
+    }
+
+
+def _kg_temporal_provenance(fact: dict) -> dict:
+    """Normalize KG output while retaining only upstream-known provenance."""
+    out = dict(fact)
+    out["date_provenance"] = {
+        "valid_from": fact.get("valid_from"),
+        "valid_to": fact.get("valid_to"),
+        "valid_from_source": "upstream" if fact.get("valid_from") is not None else None,
+        "valid_to_source": "upstream" if fact.get("valid_to") is not None else None,
+    }
+    # MemPalace 3.11 does not expose modification time for KG reads.  Do not infer it.
+    out["last_modified"] = fact.get("last_modified")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +329,17 @@ class MemPalaceProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
+            {
+                "name": "mempalace_audit",
+                "description": "Read-only MemPalace 3.11 organization audit. Never repairs, mines, invokes an LLM, or mutates palace data.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sample_limit": {"type": "integer", "description": "Maximum findings retained per audit category (default 20, max 100)"},
+                    },
+                    "required": [],
+                },
+            },
             {
                 "name": "mempalace_status",
                 "description": "Palace overview — total drawers, wing and room counts, palace path.",
@@ -530,6 +578,8 @@ class MemPalaceProvider(MemoryProvider):
                     "type": "object",
                     "properties": {
                         "entity": {"type": "string", "description": "Entity to scope timeline to (optional)"},
+                        "limit": {"type": "integer", "description": "Max facts (default 100, max 1000)"},
+                        "offset": {"type": "integer", "description": "Pagination offset (default 0)"},
                     },
                     "required": [],
                 },
@@ -821,6 +871,33 @@ class MemPalaceProvider(MemoryProvider):
     # Naming: _tool_<tool_name>. Each returns a dict; the dispatcher wraps
     # it in json.dumps.
 
+    def _tool_mempalace_audit(self, sample_limit: int = 20) -> dict:
+        """Run the upstream lock-free audit and bound only its finding samples."""
+        try:
+            sample_limit = max(1, min(int(sample_limit), _MAX_AUDIT_SAMPLE))
+        except (TypeError, ValueError):
+            return {"error": "sample_limit must be an integer between 1 and 100"}
+        from mempalace.palace_audit import audit_palace
+        report = audit_palace(palace_path=self._palace_path, explicit_palace=True)
+        bounded = {}
+        for key, value in report.items():
+            if isinstance(value, list):
+                bounded[key] = value[:sample_limit]
+            elif isinstance(value, dict):
+                bounded[key] = {
+                    child_key: (child_value[:sample_limit] if isinstance(child_value, list) else child_value)
+                    for child_key, child_value in value.items()
+                }
+            else:
+                bounded[key] = value
+        return {
+            "read_only": True,
+            "repair_performed": False,
+            "llm_invoked": False,
+            "sample_limit": sample_limit,
+            "report": bounded,
+        }
+
     def _tool_mempalace_status(self) -> dict:
         col = self._get_col(create=os.path.isfile(os.path.join(self._palace_path, "chroma.sqlite3")))
         if not col:
@@ -1060,6 +1137,8 @@ class MemPalaceProvider(MemoryProvider):
                 "wing": meta.get("wing", ""),
                 "room": meta.get("room", ""),
                 "metadata": meta,
+                "date_provenance": _drawer_temporal_provenance(meta),
+                "last_modified": meta.get("last_modified"),
             }
         except Exception as e:
             return {"error": str(e)}
@@ -1121,6 +1200,8 @@ class MemPalaceProvider(MemoryProvider):
                     "authored_at": meta.get("authored_at"),
                     "filed_at": meta.get("filed_at"),
                     "source_file": meta.get("source_file", ""),
+                    "date_provenance": _drawer_temporal_provenance(meta),
+                    "last_modified": meta.get("last_modified"),
                 })
             return {"drawers": page, "total": total, "count": len(page), "offset": offset, "limit": limit}
         except Exception as e:
@@ -1282,6 +1363,7 @@ class MemPalaceProvider(MemoryProvider):
             update_kwargs = {"ids": [drawer_id]}
             if content is not None:
                 update_kwargs["documents"] = [new_doc]
+            new_meta["last_modified"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             update_kwargs["metadatas"] = [new_meta]
             col.update(**update_kwargs)
             self._invalidate_meta_cache()
@@ -1303,7 +1385,7 @@ class MemPalaceProvider(MemoryProvider):
         if direction not in ("outgoing", "incoming", "both"):
             return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
         kg = self._get_kg()
-        results = kg.query_entity(entity, as_of=as_of, direction=direction)
+        results = [_kg_temporal_provenance(fact) for fact in kg.query_entity(entity, as_of=as_of, direction=direction)]
         return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
     def _tool_mempalace_kg_add(
@@ -1334,6 +1416,8 @@ class MemPalaceProvider(MemoryProvider):
         return {
             "success": True, "triple_id": triple_id,
             "fact": f"{subject} → {predicate} → {object}",
+            "date_provenance": {"valid_from": valid_from, "valid_to": valid_to, "valid_from_source": "provided" if valid_from else None, "valid_to_source": "provided" if valid_to else None},
+            "last_modified": None,
         }
 
     def _tool_mempalace_kg_invalidate(
@@ -1383,16 +1467,22 @@ class MemPalaceProvider(MemoryProvider):
             "superseded": old_object, "at": at or "now",
         }
 
-    def _tool_mempalace_kg_timeline(self, entity: str = None) -> dict:
+    def _tool_mempalace_kg_timeline(self, entity: str = None, limit: int = 100, offset: int = 0) -> dict:
         from mempalace.config import sanitize_kg_value
         if entity is not None:
             try:
                 entity = sanitize_kg_value(entity, "entity")
             except ValueError as e:
                 return {"error": str(e)}
+        try:
+            limit = max(1, min(int(limit), _PAGE_SIZE))
+            offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            return {"error": "limit and offset must be integers"}
         kg = self._get_kg()
-        results = kg.timeline(entity)
-        return {"entity": entity or "all", "timeline": results, "count": len(results)}
+        results = [_kg_temporal_provenance(fact) for fact in kg.timeline(entity, limit=limit, offset=offset)]
+        total = kg.timeline_total(entity)
+        return {"entity": entity or "all", "timeline": results, "count": len(results), "total": total, "limit": limit, "offset": offset}
 
     def _tool_mempalace_kg_stats(self) -> dict:
         kg = self._get_kg()
